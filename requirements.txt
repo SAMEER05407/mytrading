@@ -1,0 +1,9 @@
+flask
+python-binance
+pyTelegramBotAPI
+requests
+binance
+flask
+pyTelegramBotAPI
+python-binance
+requests
