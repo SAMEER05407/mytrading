@@ -295,6 +295,14 @@ def monitor_trade():
                 # Get fresh balance before selling
                 final_balance = get_asset_balance(asset)
                 
+                # Send immediate notification that sell is being executed
+                exec_msg = f"⏳ <b>EXECUTING SELL ORDER...</b>\n\n"
+                exec_msg += f"Profit Target Reached!\n"
+                exec_msg += f"Current P&L: ${current_pnl:.4f}\n"
+                exec_msg += f"Selling {final_balance:.8f} {asset}..."
+                send_telegram(exec_msg)
+                print(f"📤 Telegram notification sent: Executing sell order")
+                
                 sell_result = execute_sell_order(pair, final_balance)
                 
                 if sell_result['success']:
@@ -311,10 +319,15 @@ def monitor_trade():
                     
                     send_telegram(message)
                     print(f"✅ Sell executed at ${sell_price:.8f}, Profit: ${actual_profit:.4f}")
+                    print(f"📤 Telegram notification sent: Profit confirmation")
                 else:
-                    error_msg = f"⚠️ Sell order failed: {sell_result['error']}"
+                    error_msg = f"⚠️ <b>SELL ORDER FAILED!</b>\n\n"
+                    error_msg += f"Error: {sell_result['error']}\n"
+                    error_msg += f"Pair: {pair}\n"
+                    error_msg += f"Attempted Quantity: {final_balance:.8f}"
                     send_telegram(error_msg)
                     print(f"❌ Sell failed: {sell_result['error']}")
+                    print(f"📤 Telegram notification sent: Sell error")
                 
                 with trade_lock:
                     active_trade['running'] = False
@@ -334,6 +347,14 @@ def monitor_trade():
                 # Get fresh balance before selling
                 final_balance = get_asset_balance(asset)
                 
+                # Send immediate notification that stop-loss sell is being executed
+                exec_msg = f"⏳ <b>EXECUTING STOP-LOSS SELL...</b>\n\n"
+                exec_msg += f"Stop Loss Triggered!\n"
+                exec_msg += f"Current Loss: ${abs(current_pnl):.4f}\n"
+                exec_msg += f"Selling {final_balance:.8f} {asset}..."
+                send_telegram(exec_msg)
+                print(f"📤 Telegram notification sent: Executing stop-loss sell")
+                
                 sell_result = execute_sell_order(pair, final_balance)
                 
                 if sell_result['success']:
@@ -350,10 +371,15 @@ def monitor_trade():
                     
                     send_telegram(message)
                     print(f"🛑 Stop loss sell executed at ${sell_price:.8f}, Loss: ${actual_loss:.4f}")
+                    print(f"📤 Telegram notification sent: Stop-loss confirmation")
                 else:
-                    error_msg = f"⚠️ Stop-loss sell order failed: {sell_result['error']}"
+                    error_msg = f"⚠️ <b>STOP-LOSS SELL FAILED!</b>\n\n"
+                    error_msg += f"Error: {sell_result['error']}\n"
+                    error_msg += f"Pair: {pair}\n"
+                    error_msg += f"Attempted Quantity: {final_balance:.8f}"
                     send_telegram(error_msg)
                     print(f"❌ Stop loss sell failed: {sell_result['error']}")
+                    print(f"📤 Telegram notification sent: Stop-loss error")
                 
                 with trade_lock:
                     active_trade['running'] = False
