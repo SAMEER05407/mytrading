@@ -197,39 +197,49 @@ def monitor_trade():
     stop_loss = active_trade['stop_loss']
     asset = active_trade['asset']
     
-    print(f"Monitoring {pair} - Buy: ${buy_price:.8f}, Target: ${profit_target}, Stop Loss: ${stop_loss}")
+    print(f"🔍 Monitoring {pair} - Buy: ${buy_price:.8f}, Target: ${profit_target}, Stop Loss: ${stop_loss}")
+    print(f"⏱️ Checking every 2 seconds for immediate execution")
     
     consecutive_errors = 0
-    max_errors = 3
+    max_errors = 5
+    last_balance_check = 0
+    balance_check_interval = 10  # Check balance every 10 seconds to detect external sells
     
     while active_trade['running']:
         try:
-            # Check actual balance from Binance
-            current_balance = get_asset_balance(asset)
+            current_time = time.time()
             
-            # If balance is zero or very small, position was sold manually
-            if current_balance < (quantity * 0.01):  # Less than 1% of original quantity
-                print(f"⚠️ Position closed externally. Balance: {current_balance}")
+            # Check balance periodically to detect external sells
+            if current_time - last_balance_check >= balance_check_interval:
+                current_balance = get_asset_balance(asset)
+                last_balance_check = current_time
                 
-                message = f"⚠️ <b>Trade Closed Externally</b>\n\n"
-                message += f"Detected that {pair} position was sold outside the bot.\n"
-                message += f"Original quantity: {quantity:.8f}\n"
-                message += f"Current balance: {current_balance:.8f}\n\n"
-                message += f"Trade monitoring stopped."
-                
-                send_telegram(message)
-                
-                with trade_lock:
-                    active_trade['running'] = False
-                    active_trade['pair'] = None
-                    active_trade['buy_price'] = None
-                    active_trade['quantity'] = None
-                    active_trade['profit_target'] = None
-                    active_trade['stop_loss'] = None
-                    active_trade['asset'] = None
-                break
+                # If balance is zero or very small, position was sold manually
+                if current_balance < (quantity * 0.01):  # Less than 1% of original quantity
+                    print(f"⚠️ Position closed externally. Balance: {current_balance}")
+                    
+                    message = f"⚠️ <b>Trade Closed Externally</b>\n\n"
+                    message += f"Detected that {pair} position was sold outside the bot.\n"
+                    message += f"Original quantity: {quantity:.8f}\n"
+                    message += f"Current balance: {current_balance:.8f}\n\n"
+                    message += f"Trade monitoring stopped."
+                    
+                    send_telegram(message)
+                    
+                    with trade_lock:
+                        active_trade['running'] = False
+                        active_trade['pair'] = None
+                        active_trade['buy_price'] = None
+                        active_trade['quantity'] = None
+                        active_trade['profit_target'] = None
+                        active_trade['stop_loss'] = None
+                        active_trade['asset'] = None
+                    break
+            else:
+                # Use last known balance for P&L calculation
+                current_balance = get_asset_balance(asset)
             
-            # Calculate actual P&L based on current balance
+            # Calculate actual P&L based on current balance and real-time price
             pnl_data = calculate_pnl(pair, buy_price, current_balance)
             
             if not pnl_data:
@@ -240,7 +250,7 @@ def monitor_trade():
                     with trade_lock:
                         active_trade['running'] = False
                     break
-                time.sleep(5)
+                time.sleep(2)
                 continue
             
             consecutive_errors = 0  # Reset on success
@@ -248,30 +258,36 @@ def monitor_trade():
             current_price = pnl_data['current_price']
             current_pnl = pnl_data['pnl']
             
-            print(f"Balance: {current_balance:.8f} {asset} | Price: ${current_price:.8f} | P&L: ${current_pnl:.4f}")
+            print(f"📊 Balance: {current_balance:.8f} {asset} | Price: ${current_price:.8f} | P&L: ${current_pnl:.4f} | Target: ${profit_target:.4f}")
             
-            # Check if profit target reached
+            # Check if profit target reached - IMMEDIATE SELL
             if current_pnl >= profit_target:
-                print(f"✅ Profit target reached! P&L: ${current_pnl:.4f}")
+                print(f"✅ PROFIT TARGET REACHED! Executing immediate sell...")
+                print(f"📈 P&L: ${current_pnl:.4f} >= Target: ${profit_target:.4f}")
                 
-                sell_result = execute_sell_order(pair, current_balance)
+                # Get fresh balance before selling
+                final_balance = get_asset_balance(asset)
+                
+                sell_result = execute_sell_order(pair, final_balance)
                 
                 if sell_result['success']:
                     sell_price = sell_result['price']
-                    actual_profit = (sell_price - buy_price) * current_balance
+                    actual_profit = (sell_price - buy_price) * final_balance
                     
                     message = f"💰 <b>PROFIT TARGET HIT!</b>\n\n"
                     message += f"Pair: {pair}\n"
                     message += f"Buy Price: ${buy_price:.8f}\n"
                     message += f"Sell Price: ${sell_price:.8f}\n"
-                    message += f"Quantity: {current_balance:.8f}\n"
-                    message += f"Profit: ${actual_profit:.4f}\n\n"
-                    message += f"✅ Trade complete!"
+                    message += f"Quantity Sold: {final_balance:.8f}\n"
+                    message += f"Actual Profit: ${actual_profit:.4f}\n\n"
+                    message += f"✅ Trade completed successfully!"
                     
                     send_telegram(message)
+                    print(f"✅ Sell executed at ${sell_price:.8f}, Profit: ${actual_profit:.4f}")
                 else:
                     error_msg = f"⚠️ Sell order failed: {sell_result['error']}"
                     send_telegram(error_msg)
+                    print(f"❌ Sell failed: {sell_result['error']}")
                 
                 with trade_lock:
                     active_trade['running'] = False
@@ -283,28 +299,34 @@ def monitor_trade():
                     active_trade['asset'] = None
                 break
             
-            # Check if stop-loss triggered (only if stop_loss is set)
+            # Check if stop-loss triggered - IMMEDIATE SELL (only if stop_loss is set)
             elif stop_loss is not None and current_pnl <= -stop_loss:
-                print(f"🛑 Stop loss triggered! Loss: ${abs(current_pnl):.4f}")
+                print(f"🛑 STOP LOSS TRIGGERED! Executing immediate sell...")
+                print(f"📉 Loss: ${abs(current_pnl):.4f} >= Stop Loss: ${stop_loss:.4f}")
                 
-                sell_result = execute_sell_order(pair, current_balance)
+                # Get fresh balance before selling
+                final_balance = get_asset_balance(asset)
+                
+                sell_result = execute_sell_order(pair, final_balance)
                 
                 if sell_result['success']:
                     sell_price = sell_result['price']
-                    actual_loss = (sell_price - buy_price) * current_balance
+                    actual_loss = (sell_price - buy_price) * final_balance
                     
                     message = f"🛑 <b>STOP LOSS TRIGGERED!</b>\n\n"
                     message += f"Pair: {pair}\n"
                     message += f"Buy Price: ${buy_price:.8f}\n"
                     message += f"Sell Price: ${sell_price:.8f}\n"
-                    message += f"Quantity: {current_balance:.8f}\n"
-                    message += f"Loss: ${actual_loss:.4f}\n\n"
+                    message += f"Quantity Sold: {final_balance:.8f}\n"
+                    message += f"Actual Loss: ${actual_loss:.4f}\n\n"
                     message += f"Trade closed to prevent further losses."
                     
                     send_telegram(message)
+                    print(f"🛑 Stop loss sell executed at ${sell_price:.8f}, Loss: ${actual_loss:.4f}")
                 else:
                     error_msg = f"⚠️ Stop-loss sell order failed: {sell_result['error']}"
                     send_telegram(error_msg)
+                    print(f"❌ Stop loss sell failed: {sell_result['error']}")
                 
                 with trade_lock:
                     active_trade['running'] = False
@@ -316,10 +338,11 @@ def monitor_trade():
                     active_trade['asset'] = None
                 break
             
-            time.sleep(5)
+            # Sleep for 2 seconds before next check
+            time.sleep(2)
             
         except Exception as e:
-            print(f"Monitoring error: {e}")
+            print(f"⚠️ Monitoring error: {e}")
             consecutive_errors += 1
             if consecutive_errors >= max_errors:
                 error_msg = f"⚠️ Critical monitoring error. Stopping trade monitoring."
@@ -327,7 +350,7 @@ def monitor_trade():
                 with trade_lock:
                     active_trade['running'] = False
                 break
-            time.sleep(5)
+            time.sleep(2)
 
 @app.route('/')
 def index():
