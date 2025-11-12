@@ -1,3 +1,4 @@
+
 from flask import Flask, render_template
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
@@ -28,7 +29,9 @@ active_trade = {
     'pair': None,
     'buy_price': None,
     'quantity': None,
-    'profit_target': None
+    'profit_target': None,
+    'stop_loss': None,
+    'asset': None
 }
 
 trade_lock = threading.Lock()
@@ -51,7 +54,16 @@ def get_server_ip():
     except:
         return 'Unable to fetch IP'
 
-def validate_trade_inputs(pair, amount, profit):
+def get_asset_balance(asset):
+    """Get actual balance of an asset from Binance"""
+    try:
+        balance = binance_client.get_asset_balance(asset=asset)
+        return float(balance['free']) + float(balance['locked'])
+    except Exception as e:
+        print(f"Error getting balance for {asset}: {e}")
+        return 0.0
+
+def validate_trade_inputs(pair, amount, profit, stop_loss):
     """Validate trading inputs"""
     errors = []
     
@@ -71,6 +83,12 @@ def validate_trade_inputs(pair, amount, profit):
     
     if profit <= 0:
         errors.append("Profit must be > 0")
+    
+    if stop_loss <= 0:
+        errors.append("Stop loss must be > 0")
+    
+    if stop_loss >= amount:
+        errors.append("Stop loss must be less than investment amount")
     
     return errors
 
@@ -147,46 +165,58 @@ def execute_sell_order(pair, quantity):
             'error': str(e)
         }
 
+def calculate_pnl(pair, buy_price, current_balance):
+    """Calculate actual P&L based on current balance and price"""
+    try:
+        ticker = binance_client.get_symbol_ticker(symbol=pair)
+        current_price = float(ticker['price'])
+        
+        current_value = current_balance * current_price
+        invested_value = current_balance * buy_price
+        
+        pnl = current_value - invested_value
+        
+        return {
+            'current_price': current_price,
+            'current_value': current_value,
+            'pnl': pnl
+        }
+    except Exception as e:
+        print(f"Error calculating P&L: {e}")
+        return None
+
 def monitor_trade():
-    """Background thread to monitor price and execute sell when profit target is reached"""
+    """Background thread to monitor price, check balance, and execute sell when profit target is reached or stop-loss triggered"""
     global active_trade
     
     pair = active_trade['pair']
     buy_price = active_trade['buy_price']
     quantity = active_trade['quantity']
     profit_target = active_trade['profit_target']
+    stop_loss = active_trade['stop_loss']
+    asset = active_trade['asset']
     
-    print(f"Monitoring {pair} - Buy: ${buy_price:.8f}, Target Profit: ${profit_target}")
+    print(f"Monitoring {pair} - Buy: ${buy_price:.8f}, Target: ${profit_target}, Stop Loss: ${stop_loss}")
+    
+    consecutive_errors = 0
+    max_errors = 3
     
     while active_trade['running']:
         try:
-            ticker = binance_client.get_symbol_ticker(symbol=pair)
-            current_price = float(ticker['price'])
+            # Check actual balance from Binance
+            current_balance = get_asset_balance(asset)
             
-            current_profit = (current_price - buy_price) * quantity
-            
-            print(f"Current Price: ${current_price:.8f}, Profit: ${current_profit:.4f}")
-            
-            if current_profit >= profit_target:
-                print(f"Profit target reached! Selling...")
+            # If balance is zero or very small, position was sold manually
+            if current_balance < (quantity * 0.01):  # Less than 1% of original quantity
+                print(f"⚠️ Position closed externally. Balance: {current_balance}")
                 
-                sell_result = execute_sell_order(pair, quantity)
+                message = f"⚠️ <b>Trade Closed Externally</b>\n\n"
+                message += f"Detected that {pair} position was sold outside the bot.\n"
+                message += f"Original quantity: {quantity:.8f}\n"
+                message += f"Current balance: {current_balance:.8f}\n\n"
+                message += f"Trade monitoring stopped."
                 
-                if sell_result['success']:
-                    sell_price = sell_result['price']
-                    actual_profit = (sell_price - buy_price) * quantity
-                    
-                    message = f"💰 <b>Profit Target Reached!</b>\n"
-                    message += f"Sold at ${sell_price:.8f}\n"
-                    message += f"Profit: ${actual_profit:.4f}\n"
-                    message += f"Trade Complete. Ready for next one."
-                    
-                    send_telegram(message)
-                    print(message.replace('<b>', '').replace('</b>', ''))
-                else:
-                    error_msg = f"⚠️ Sell order failed: {sell_result['error']}"
-                    send_telegram(error_msg)
-                    print(error_msg)
+                send_telegram(message)
                 
                 with trade_lock:
                     active_trade['running'] = False
@@ -194,12 +224,108 @@ def monitor_trade():
                     active_trade['buy_price'] = None
                     active_trade['quantity'] = None
                     active_trade['profit_target'] = None
+                    active_trade['stop_loss'] = None
+                    active_trade['asset'] = None
+                break
+            
+            # Calculate actual P&L based on current balance
+            pnl_data = calculate_pnl(pair, buy_price, current_balance)
+            
+            if not pnl_data:
+                consecutive_errors += 1
+                if consecutive_errors >= max_errors:
+                    error_msg = f"⚠️ Failed to fetch price data {max_errors} times. Stopping monitoring."
+                    send_telegram(error_msg)
+                    with trade_lock:
+                        active_trade['running'] = False
+                    break
+                time.sleep(5)
+                continue
+            
+            consecutive_errors = 0  # Reset on success
+            
+            current_price = pnl_data['current_price']
+            current_pnl = pnl_data['pnl']
+            
+            print(f"Balance: {current_balance:.8f} {asset} | Price: ${current_price:.8f} | P&L: ${current_pnl:.4f}")
+            
+            # Check if profit target reached
+            if current_pnl >= profit_target:
+                print(f"✅ Profit target reached! P&L: ${current_pnl:.4f}")
+                
+                sell_result = execute_sell_order(pair, current_balance)
+                
+                if sell_result['success']:
+                    sell_price = sell_result['price']
+                    actual_profit = (sell_price - buy_price) * current_balance
+                    
+                    message = f"💰 <b>PROFIT TARGET HIT!</b>\n\n"
+                    message += f"Pair: {pair}\n"
+                    message += f"Buy Price: ${buy_price:.8f}\n"
+                    message += f"Sell Price: ${sell_price:.8f}\n"
+                    message += f"Quantity: {current_balance:.8f}\n"
+                    message += f"Profit: ${actual_profit:.4f}\n\n"
+                    message += f"✅ Trade complete!"
+                    
+                    send_telegram(message)
+                else:
+                    error_msg = f"⚠️ Sell order failed: {sell_result['error']}"
+                    send_telegram(error_msg)
+                
+                with trade_lock:
+                    active_trade['running'] = False
+                    active_trade['pair'] = None
+                    active_trade['buy_price'] = None
+                    active_trade['quantity'] = None
+                    active_trade['profit_target'] = None
+                    active_trade['stop_loss'] = None
+                    active_trade['asset'] = None
+                break
+            
+            # Check if stop-loss triggered
+            elif current_pnl <= -stop_loss:
+                print(f"🛑 Stop loss triggered! Loss: ${abs(current_pnl):.4f}")
+                
+                sell_result = execute_sell_order(pair, current_balance)
+                
+                if sell_result['success']:
+                    sell_price = sell_result['price']
+                    actual_loss = (sell_price - buy_price) * current_balance
+                    
+                    message = f"🛑 <b>STOP LOSS TRIGGERED!</b>\n\n"
+                    message += f"Pair: {pair}\n"
+                    message += f"Buy Price: ${buy_price:.8f}\n"
+                    message += f"Sell Price: ${sell_price:.8f}\n"
+                    message += f"Quantity: {current_balance:.8f}\n"
+                    message += f"Loss: ${actual_loss:.4f}\n\n"
+                    message += f"Trade closed to prevent further losses."
+                    
+                    send_telegram(message)
+                else:
+                    error_msg = f"⚠️ Stop-loss sell order failed: {sell_result['error']}"
+                    send_telegram(error_msg)
+                
+                with trade_lock:
+                    active_trade['running'] = False
+                    active_trade['pair'] = None
+                    active_trade['buy_price'] = None
+                    active_trade['quantity'] = None
+                    active_trade['profit_target'] = None
+                    active_trade['stop_loss'] = None
+                    active_trade['asset'] = None
                 break
             
             time.sleep(5)
             
         except Exception as e:
             print(f"Monitoring error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors >= max_errors:
+                error_msg = f"⚠️ Critical monitoring error. Stopping trade monitoring."
+                send_telegram(error_msg)
+                with trade_lock:
+                    active_trade['running'] = False
+                break
             time.sleep(5)
 
 @app.route('/')
@@ -221,103 +347,119 @@ def setup_telegram_handlers():
 
 <b>Commands:</b>
 
-/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt;
-Start a new trade
+/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; &lt;stop_loss&gt;
+Start a new trade with stop-loss
 
-Example: /trade BTCUSDT 20 0.2
+Example: /trade BTCUSDT 20 0.5 0.3
 
 • pair: Trading pair (must end with USDT)
-• amount: Amount in USD (minimum $5)
+• amount: Investment in USD (minimum $5)
 • profit: Profit target in USD (must be > 0)
+• stop_loss: Maximum loss in USD (must be > 0)
 
 /status
-Check current trade status
+Check current trade with real-time P&L
 
 /help
 Show this message
 
-<b>Rules:</b>
+<b>Features:</b>
+✅ Real balance & P&L checking
+✅ Auto-sell on profit target
+✅ Auto-sell on stop-loss
+✅ Detects external position closure
 ✅ Only one trade at a time
-✅ Spot trading only (no futures)
-✅ Bot monitors price every 5 seconds
-✅ Auto-sells when profit target reached
 """
         send_telegram(help_text, message.chat.id)
 
     @telegram_bot.message_handler(commands=['status'])
     def check_status(message):
-        """Check active trade status"""
+        """Check active trade status with real balance"""
         with trade_lock:
             if active_trade['running']:
                 pair = active_trade['pair']
                 buy_price = active_trade['buy_price']
-                quantity = active_trade['quantity']
                 profit_target = active_trade['profit_target']
+                stop_loss = active_trade['stop_loss']
+                asset = active_trade['asset']
                 
                 try:
-                    ticker = binance_client.get_symbol_ticker(symbol=pair)
-                    current_price = float(ticker['price'])
-                    current_profit = (current_price - buy_price) * quantity
+                    current_balance = get_asset_balance(asset)
                     
-                    status_msg = f"📊 <b>Active Trade</b>\n\n"
-                    status_msg += f"Pair: {pair}\n"
-                    status_msg += f"Buy Price: ${buy_price:.8f}\n"
-                    status_msg += f"Current Price: ${current_price:.8f}\n"
-                    status_msg += f"Quantity: {quantity:.8f}\n"
-                    status_msg += f"Current Profit: ${current_profit:.4f}\n"
-                    status_msg += f"Target Profit: ${profit_target:.4f}\n"
+                    if current_balance < (active_trade['quantity'] * 0.01):
+                        status_msg = "⚠️ Position appears to be closed externally. Bot will stop monitoring shortly."
+                        send_telegram(status_msg, message.chat.id)
+                        return
                     
-                    percent = (current_profit / profit_target) * 100
-                    status_msg += f"Progress: {percent:.1f}%"
+                    pnl_data = calculate_pnl(pair, buy_price, current_balance)
                     
-                    send_telegram(status_msg, message.chat.id)
+                    if pnl_data:
+                        current_price = pnl_data['current_price']
+                        current_pnl = pnl_data['pnl']
+                        
+                        status_msg = f"📊 <b>Active Trade Status</b>\n\n"
+                        status_msg += f"Pair: {pair}\n"
+                        status_msg += f"Buy Price: ${buy_price:.8f}\n"
+                        status_msg += f"Current Price: ${current_price:.8f}\n"
+                        status_msg += f"Balance: {current_balance:.8f} {asset}\n\n"
+                        status_msg += f"<b>P&L: ${current_pnl:.4f}</b>\n"
+                        status_msg += f"Target Profit: ${profit_target:.4f}\n"
+                        status_msg += f"Stop Loss: ${stop_loss:.4f}\n\n"
+                        
+                        if current_pnl > 0:
+                            profit_percent = (current_pnl / profit_target) * 100
+                            status_msg += f"Progress: {profit_percent:.1f}% to target 📈"
+                        else:
+                            loss_percent = (abs(current_pnl) / stop_loss) * 100
+                            status_msg += f"Loss: {loss_percent:.1f}% of stop-loss 📉"
+                        
+                        send_telegram(status_msg, message.chat.id)
+                    else:
+                        send_telegram("⚠️ Error fetching current data", message.chat.id)
                 except Exception as e:
-                    send_telegram(f"⚠️ Error fetching status: {e}", message.chat.id)
+                    send_telegram(f"⚠️ Error: {e}", message.chat.id)
             else:
                 send_telegram("✅ No active trade. Use /trade to start one.", message.chat.id)
 
     @telegram_bot.message_handler(commands=['trade'])
     def start_trade_command(message):
-        """Handle /trade command"""
+        """Handle /trade command with stop-loss"""
         
         if not binance_client:
-            send_telegram("⚠️ Binance API keys not configured. Please set environment variables.", message.chat.id)
+            send_telegram("⚠️ Binance API keys not configured.", message.chat.id)
             return
         
         try:
             parts = message.text.split()
             
-            if len(parts) != 4:
-                error_msg = "⚠️ <b>Invalid command format!</b>\n\n"
-                error_msg += "<b>Usage:</b>\n/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt;\n\n"
-                error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.2"
+            if len(parts) != 5:
+                error_msg = "⚠️ <b>Invalid format!</b>\n\n"
+                error_msg += "<b>Usage:</b>\n/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; &lt;stop_loss&gt;\n\n"
+                error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.5 0.3"
                 send_telegram(error_msg, message.chat.id)
                 return
             
             pair = parts[1].upper().strip()
             amount = float(parts[2])
             profit_target = float(parts[3])
+            stop_loss = float(parts[4])
             
         except (ValueError, IndexError):
             error_msg = "⚠️ <b>Invalid values!</b>\n\n"
-            error_msg += "Make sure amount and profit are numbers.\n\n"
-            error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.2"
+            error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.5 0.3"
             send_telegram(error_msg, message.chat.id)
             return
         
-        errors = validate_trade_inputs(pair, amount, profit_target)
+        errors = validate_trade_inputs(pair, amount, profit_target, stop_loss)
         if errors:
-            error_msg = f"⚠️ <b>Invalid command.</b> Example:\n"
-            error_msg += f"Pair: BTCUSDT\n"
-            error_msg += f"Amount: 20\n"
-            error_msg += f"Profit: 0.2\n\n"
-            error_msg += f"<b>Errors:</b>\n" + "\n".join(f"• {e}" for e in errors)
+            error_msg = f"⚠️ <b>Validation errors:</b>\n\n"
+            error_msg += "\n".join(f"• {e}" for e in errors)
             send_telegram(error_msg, message.chat.id)
             return
         
         with trade_lock:
             if active_trade['running']:
-                send_telegram("🚫 Trade already running! Wait for it to finish.", message.chat.id)
+                send_telegram("🚫 Trade already running! Wait for it to finish or sell manually.", message.chat.id)
                 return
             
             active_trade['running'] = True
@@ -332,17 +474,24 @@ Show this message
                 active_trade['running'] = False
             return
         
+        asset = pair.replace('USDT', '')
+        
         with trade_lock:
             active_trade['pair'] = pair
             active_trade['buy_price'] = buy_result['price']
             active_trade['quantity'] = buy_result['quantity']
             active_trade['profit_target'] = profit_target
+            active_trade['stop_loss'] = stop_loss
+            active_trade['asset'] = asset
         
-        success_msg = f"✅ <b>Bought {pair}</b>\n"
-        success_msg += f"Price: ${buy_result['price']:.8f}\n"
-        success_msg += f"Amount: ${amount:.2f}\n"
-        success_msg += f"Target Profit: ${profit_target:.4f}\n\n"
-        success_msg += f"Monitoring price every 5 seconds..."
+        success_msg = f"✅ <b>Trade Started</b>\n\n"
+        success_msg += f"Pair: {pair}\n"
+        success_msg += f"Buy Price: ${buy_result['price']:.8f}\n"
+        success_msg += f"Quantity: {buy_result['quantity']:.8f} {asset}\n"
+        success_msg += f"Investment: ${amount:.2f}\n\n"
+        success_msg += f"Target Profit: ${profit_target:.4f} 🎯\n"
+        success_msg += f"Stop Loss: ${stop_loss:.4f} 🛑\n\n"
+        success_msg += f"Monitoring with balance verification..."
         send_telegram(success_msg, message.chat.id)
         
         monitor_thread = threading.Thread(target=monitor_trade, daemon=True)
