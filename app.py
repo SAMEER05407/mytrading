@@ -153,8 +153,9 @@ def validate_futures_inputs(pair, amount, profit, stop_loss, leverage):
     if not pair.endswith('USDT'):
         errors.append("Pair must end with USDT")
     
-    if amount < 5:
-        errors.append("Amount must be ≥ $5")
+    # Higher minimum for futures to avoid quantity issues
+    if amount < 10:
+        errors.append("Amount must be ≥ $10 for futures trading")
     
     if profit <= 0:
         errors.append("Profit must be > 0")
@@ -164,6 +165,10 @@ def validate_futures_inputs(pair, amount, profit, stop_loss, leverage):
     
     if leverage < 1 or leverage > 20:
         errors.append("Leverage must be between 1 and 20")
+    
+    # Warn about high leverage
+    if leverage > 10:
+        errors.append("⚠️ Warning: Leverage > 10x is very risky!")
     
     return errors
 
@@ -273,23 +278,46 @@ def execute_futures_order(pair, side, amount_usd, leverage):
         ticker = binance_client.futures_symbol_ticker(symbol=pair)
         current_price = float(ticker['price'])
         
-        # Calculate quantity
-        quantity = (amount_usd * leverage) / current_price
-        
-        # Get precision
+        # Get precision and filters first
         info = binance_client.futures_exchange_info()
         precision = 3
         step_size = 0.0
+        min_qty = 0.0
+        
         for s in info['symbols']:
             if s['symbol'] == pair:
                 for f in s['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         step_size = float(f['stepSize'])
+                        min_qty = float(f['minQty'])
                         precision = len(str(step_size).rstrip('0').split('.')[-1])
                         break
                 break
         
-        quantity = round(quantity, precision)
+        # Calculate quantity with leverage
+        quantity = (amount_usd * leverage) / current_price
+        
+        # Round down to step size
+        if step_size > 0:
+            quantity = (quantity // step_size) * step_size
+            quantity = round(quantity, precision)
+        
+        # Ensure minimum quantity
+        if quantity < min_qty:
+            # Try to use minimum quantity
+            quantity = min_qty
+        
+        # Final validation
+        if quantity <= 0:
+            return {
+                'success': False,
+                'error': f'Calculated quantity ({quantity}) is too small. Increase investment amount or reduce leverage.'
+            }
+        
+        print(f"📊 Futures Order Details:")
+        print(f"   Amount: ${amount_usd}, Leverage: {leverage}x")
+        print(f"   Price: ${current_price}, Quantity: {quantity}")
+        print(f"   Min Qty: {min_qty}, Step Size: {step_size}")
         
         # Place order
         order = binance_client.futures_create_order(
