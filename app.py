@@ -84,11 +84,12 @@ def validate_trade_inputs(pair, amount, profit, stop_loss):
     if profit <= 0:
         errors.append("Profit must be > 0")
     
-    if stop_loss <= 0:
-        errors.append("Stop loss must be > 0")
-    
-    if stop_loss >= amount:
-        errors.append("Stop loss must be less than investment amount")
+    if stop_loss is not None:
+        if stop_loss <= 0:
+            errors.append("Stop loss must be > 0")
+        
+        if stop_loss >= amount:
+            errors.append("Stop loss must be less than investment amount")
     
     return errors
 
@@ -282,8 +283,8 @@ def monitor_trade():
                     active_trade['asset'] = None
                 break
             
-            # Check if stop-loss triggered
-            elif current_pnl <= -stop_loss:
+            # Check if stop-loss triggered (only if stop_loss is set)
+            elif stop_loss is not None and current_pnl <= -stop_loss:
                 print(f"🛑 Stop loss triggered! Loss: ${abs(current_pnl):.4f}")
                 
                 sell_result = execute_sell_order(pair, current_balance)
@@ -347,15 +348,18 @@ def setup_telegram_handlers():
 
 <b>Commands:</b>
 
-/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; &lt;stop_loss&gt;
-Start a new trade with stop-loss
+/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; [stop_loss]
+Start a new trade with optional stop-loss
 
-Example: /trade BTCUSDT 20 0.5 0.3
+<b>Examples:</b>
+• /trade BTCUSDT 20 0.5 (without stop loss)
+• /trade BTCUSDT 20 0.5 0.3 (with stop loss)
 
+<b>Parameters:</b>
 • pair: Trading pair (must end with USDT)
 • amount: Investment in USD (minimum $5)
 • profit: Profit target in USD (must be > 0)
-• stop_loss: Maximum loss in USD (must be > 0)
+• stop_loss: (Optional) Maximum loss in USD
 
 /status
 Check current trade with real-time P&L
@@ -366,7 +370,7 @@ Show this message
 <b>Features:</b>
 ✅ Real balance & P&L checking
 ✅ Auto-sell on profit target
-✅ Auto-sell on stop-loss
+✅ Optional stop-loss protection
 ✅ Detects external position closure
 ✅ Only one trade at a time
 """
@@ -404,14 +408,20 @@ Show this message
                         status_msg += f"Balance: {current_balance:.8f} {asset}\n\n"
                         status_msg += f"<b>P&L: ${current_pnl:.4f}</b>\n"
                         status_msg += f"Target Profit: ${profit_target:.4f}\n"
-                        status_msg += f"Stop Loss: ${stop_loss:.4f}\n\n"
+                        if stop_loss is not None:
+                            status_msg += f"Stop Loss: ${stop_loss:.4f}\n\n"
+                        else:
+                            status_msg += f"Stop Loss: Not Set\n\n"
                         
                         if current_pnl > 0:
                             profit_percent = (current_pnl / profit_target) * 100
                             status_msg += f"Progress: {profit_percent:.1f}% to target 📈"
                         else:
-                            loss_percent = (abs(current_pnl) / stop_loss) * 100
-                            status_msg += f"Loss: {loss_percent:.1f}% of stop-loss 📉"
+                            if stop_loss is not None:
+                                loss_percent = (abs(current_pnl) / stop_loss) * 100
+                                status_msg += f"Loss: {loss_percent:.1f}% of stop-loss 📉"
+                            else:
+                                status_msg += f"Current Loss: ${abs(current_pnl):.4f} (No stop-loss) ⚠️"
                         
                         send_telegram(status_msg, message.chat.id)
                     else:
@@ -423,7 +433,7 @@ Show this message
 
     @telegram_bot.message_handler(commands=['trade'])
     def start_trade_command(message):
-        """Handle /trade command with stop-loss"""
+        """Handle /trade command with optional stop-loss"""
         
         if not binance_client:
             send_telegram("⚠️ Binance API keys not configured.", message.chat.id)
@@ -432,21 +442,25 @@ Show this message
         try:
             parts = message.text.split()
             
-            if len(parts) != 5:
+            if len(parts) < 4 or len(parts) > 5:
                 error_msg = "⚠️ <b>Invalid format!</b>\n\n"
-                error_msg += "<b>Usage:</b>\n/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; &lt;stop_loss&gt;\n\n"
-                error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.5 0.3"
+                error_msg += "<b>Usage:</b>\n/trade &lt;pair&gt; &lt;amount&gt; &lt;profit&gt; [stop_loss]\n\n"
+                error_msg += "<b>Examples:</b>\n"
+                error_msg += "• /trade BTCUSDT 20 0.5 (without stop loss)\n"
+                error_msg += "• /trade BTCUSDT 20 0.5 0.3 (with stop loss)"
                 send_telegram(error_msg, message.chat.id)
                 return
             
             pair = parts[1].upper().strip()
             amount = float(parts[2])
             profit_target = float(parts[3])
-            stop_loss = float(parts[4])
+            stop_loss = float(parts[4]) if len(parts) == 5 else None
             
         except (ValueError, IndexError):
             error_msg = "⚠️ <b>Invalid values!</b>\n\n"
-            error_msg += "<b>Example:</b>\n/trade BTCUSDT 20 0.5 0.3"
+            error_msg += "<b>Examples:</b>\n"
+            error_msg += "• /trade BTCUSDT 20 0.5\n"
+            error_msg += "• /trade BTCUSDT 20 0.5 0.3"
             send_telegram(error_msg, message.chat.id)
             return
         
@@ -490,7 +504,10 @@ Show this message
         success_msg += f"Quantity: {buy_result['quantity']:.8f} {asset}\n"
         success_msg += f"Investment: ${amount:.2f}\n\n"
         success_msg += f"Target Profit: ${profit_target:.4f} 🎯\n"
-        success_msg += f"Stop Loss: ${stop_loss:.4f} 🛑\n\n"
+        if stop_loss is not None:
+            success_msg += f"Stop Loss: ${stop_loss:.4f} 🛑\n\n"
+        else:
+            success_msg += f"Stop Loss: Not Set ⚠️\n\n"
         success_msg += f"Monitoring with balance verification..."
         send_telegram(success_msg, message.chat.id)
         
