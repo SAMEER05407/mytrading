@@ -139,8 +139,35 @@ def execute_buy_order(pair, amount_usd):
         }
 
 def execute_sell_order(pair, quantity):
-    """Execute market sell order"""
+    """Execute market sell order with proper quantity formatting"""
     try:
+        # Get symbol info for LOT_SIZE filter
+        info = binance_client.get_symbol_info(pair)
+        step_size = 0.0
+        min_qty = 0.0
+        
+        for f in info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step_size = float(f['stepSize'])
+                min_qty = float(f['minQty'])
+                break
+        
+        # Format quantity according to step size
+        if step_size > 0:
+            precision = len(str(step_size).rstrip('0').split('.')[-1])
+            quantity = float(quantity)
+            
+            # Round down to nearest step_size
+            quantity = (quantity // step_size) * step_size
+            quantity = round(quantity, precision)
+        
+        # Check minimum quantity
+        if quantity < min_qty:
+            return {
+                'success': False,
+                'error': f'Quantity {quantity} is below minimum {min_qty}'
+            }
+        
         order = binance_client.order_market_sell(
             symbol=pair,
             quantity=quantity
