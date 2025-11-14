@@ -83,6 +83,102 @@ def get_server_ip():
     except:
         return 'Unable to fetch IP'
 
+def calculate_ema(klines, period):
+    """Calculate Exponential Moving Average"""
+    closes = [float(k[4]) for k in klines]
+    
+    if len(closes) < period:
+        return None
+    
+    ema = [sum(closes[:period]) / period]
+    multiplier = 2 / (period + 1)
+    
+    for i in range(period, len(closes)):
+        ema_value = (closes[i] - ema[-1]) * multiplier + ema[-1]
+        ema.append(ema_value)
+    
+    return ema[-1]
+
+def calculate_atr(klines, period=14):
+    """Calculate Average True Range using most recent candles"""
+    if len(klines) < period + 1:
+        return None
+    
+    true_ranges = []
+    for i in range(1, len(klines)):
+        high = float(klines[i][2])
+        low = float(klines[i][3])
+        prev_close = float(klines[i-1][4])
+        
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        true_ranges.append(tr)
+    
+    if len(true_ranges) < period:
+        return None
+    
+    atr = sum(true_ranges[-period:]) / period
+    return atr
+
+def check_market_conditions(pair, is_futures=False):
+    """Check EMA slope and ATR to filter sideways/low volatility markets"""
+    try:
+        if is_futures:
+            klines = binance_client.futures_klines(symbol=pair, interval='5m', limit=100)
+        else:
+            klines = binance_client.get_klines(symbol=pair, interval='5m', limit=100)
+        
+        ema_9 = calculate_ema(klines, 9)
+        ema_20 = calculate_ema(klines, 20)
+        atr = calculate_atr(klines, 14)
+        
+        if ema_9 is None or ema_20 is None or atr is None:
+            return {
+                'valid': False,
+                'reason': 'Insufficient data for technical analysis'
+            }
+        
+        current_price = float(klines[-1][4])
+        
+        ema_slope = ((ema_9 - ema_20) / current_price) * 100
+        atr_percent = (atr / current_price) * 100
+        
+        sideways_threshold = 0.15
+        atr_threshold = 0.10
+        
+        issues = []
+        
+        if abs(ema_slope) < sideways_threshold:
+            issues.append(f"Sideways market detected (EMA slope: {ema_slope:.3f}%)")
+        
+        if atr_percent < atr_threshold:
+            issues.append(f"Low volatility (ATR: {atr_percent:.3f}%)")
+        
+        if issues:
+            return {
+                'valid': False,
+                'reason': ' | '.join(issues),
+                'ema_slope': ema_slope,
+                'atr_percent': atr_percent
+            }
+        
+        return {
+            'valid': True,
+            'ema_slope': ema_slope,
+            'atr_percent': atr_percent,
+            'trend': 'BULLISH' if ema_slope > 0 else 'BEARISH'
+        }
+        
+    except Exception as e:
+        print(f"Error checking market conditions: {e}")
+        return {
+            'valid': False,
+            'reason': f'Error: {str(e)}'
+        }
+
 def get_asset_balance(asset):
     """Get actual balance of an asset from Binance"""
     try:
@@ -199,11 +295,23 @@ def execute_buy_order(pair, amount_usd):
         fills = order.get('fills', [])
         total_qty = 0
         total_cost = 0
-        for fill in fills:
-            total_qty += float(fill['qty'])
-            total_cost += float(fill['price']) * float(fill['qty'])
         
-        avg_price = total_cost / total_qty if total_qty > 0 else current_price
+        if fills:
+            for fill in fills:
+                total_qty += float(fill['qty'])
+                total_cost += float(fill['price']) * float(fill['qty'])
+            avg_price = total_cost / total_qty
+        else:
+            order_id = order['orderId']
+            time.sleep(0.5)
+            order_status = binance_client.get_order(symbol=pair, orderId=order_id)
+            total_qty = float(order_status.get('executedQty', quantity))
+            avg_price = float(order_status.get('avgPrice', current_price)) if order_status.get('avgPrice') else current_price
+        
+        if avg_price == 0 or total_qty == 0:
+            raise Exception("Failed to get valid entry price or quantity from order")
+        
+        print(f"✅ BUY ORDER FILLED: Price=${avg_price:.8f}, Qty={total_qty:.8f}")
         
         return {
             'success': True,
@@ -251,11 +359,25 @@ def execute_sell_order(pair, quantity):
         fills = order.get('fills', [])
         total_qty = 0
         total_cost = 0
-        for fill in fills:
-            total_qty += float(fill['qty'])
-            total_cost += float(fill['price']) * float(fill['qty'])
         
-        avg_price = total_cost / total_qty if total_qty > 0 else 0
+        if fills:
+            for fill in fills:
+                total_qty += float(fill['qty'])
+                total_cost += float(fill['price']) * float(fill['qty'])
+            avg_price = total_cost / total_qty
+        else:
+            order_id = order['orderId']
+            time.sleep(0.5)
+            order_status = binance_client.get_order(symbol=pair, orderId=order_id)
+            total_qty = float(order_status.get('executedQty', quantity))
+            avg_price = float(order_status.get('avgPrice', 0))
+        
+        if avg_price == 0:
+            ticker = binance_client.get_symbol_ticker(symbol=pair)
+            avg_price = float(ticker['price'])
+            print(f"⚠️ Warning: Using ticker price as fallback for exit: ${avg_price:.8f}")
+        
+        print(f"✅ SELL ORDER FILLED: Price=${avg_price:.8f}, Qty={total_qty:.8f}")
         
         return {
             'success': True,
@@ -271,14 +393,11 @@ def execute_sell_order(pair, quantity):
 def execute_futures_order(pair, side, amount_usd, leverage):
     """Execute futures market order (LONG or SHORT)"""
     try:
-        # Set leverage
         binance_client.futures_change_leverage(symbol=pair, leverage=leverage)
         
-        # Get current price
         ticker = binance_client.futures_symbol_ticker(symbol=pair)
         current_price = float(ticker['price'])
         
-        # Get precision and filters first
         info = binance_client.futures_exchange_info()
         precision = 3
         step_size = 0.0
@@ -294,20 +413,15 @@ def execute_futures_order(pair, side, amount_usd, leverage):
                         break
                 break
         
-        # Calculate quantity with leverage
         quantity = (amount_usd * leverage) / current_price
         
-        # Round down to step size
         if step_size > 0:
             quantity = (quantity // step_size) * step_size
             quantity = round(quantity, precision)
         
-        # Ensure minimum quantity
         if quantity < min_qty:
-            # Try to use minimum quantity
             quantity = min_qty
         
-        # Final validation
         if quantity <= 0:
             return {
                 'success': False,
@@ -316,10 +430,9 @@ def execute_futures_order(pair, side, amount_usd, leverage):
         
         print(f"📊 Futures Order Details:")
         print(f"   Amount: ${amount_usd}, Leverage: {leverage}x")
-        print(f"   Price: ${current_price}, Quantity: {quantity}")
+        print(f"   Estimated Price: ${current_price}, Quantity: {quantity}")
         print(f"   Min Qty: {min_qty}, Step Size: {step_size}")
         
-        # Place order
         order = binance_client.futures_create_order(
             symbol=pair,
             side='BUY' if side == 'LONG' else 'SELL',
@@ -327,10 +440,29 @@ def execute_futures_order(pair, side, amount_usd, leverage):
             quantity=quantity
         )
         
+        time.sleep(0.5)
+        
+        order_id = order['orderId']
+        order_status = binance_client.futures_get_order(symbol=pair, orderId=order_id)
+        
+        actual_qty = float(order_status.get('executedQty', quantity))
+        avg_price = float(order_status.get('avgPrice', 0))
+        
+        if avg_price == 0:
+            ticker_fresh = binance_client.futures_symbol_ticker(symbol=pair)
+            avg_price = float(ticker_fresh['price'])
+            print(f"⚠️ Warning: Using ticker price as fallback: ${avg_price:.8f}")
+        
+        if actual_qty == 0:
+            actual_qty = quantity
+            print(f"⚠️ Warning: Using calculated quantity as fallback: {actual_qty:.8f}")
+        
+        print(f"✅ FUTURES ORDER FILLED: Price=${avg_price:.8f}, Qty={actual_qty:.8f}")
+        
         return {
             'success': True,
-            'price': current_price,
-            'quantity': quantity,
+            'price': avg_price,
+            'quantity': actual_qty,
             'order': order
         }
     except Exception as e:
@@ -340,9 +472,8 @@ def execute_futures_order(pair, side, amount_usd, leverage):
         }
 
 def close_futures_position(pair):
-    """Close futures position"""
+    """Close futures position using MARKET order"""
     try:
-        # Get current position
         positions = binance_client.futures_position_information(symbol=pair)
         position_amt = 0.0
         
@@ -354,9 +485,10 @@ def close_futures_position(pair):
         if position_amt == 0:
             return {'success': False, 'error': 'No open position'}
         
-        # Close position
         side = 'SELL' if position_amt > 0 else 'BUY'
         quantity = abs(position_amt)
+        
+        print(f"🔄 Closing position: {side} {quantity} {pair} at MARKET")
         
         order = binance_client.futures_create_order(
             symbol=pair,
@@ -365,17 +497,28 @@ def close_futures_position(pair):
             quantity=quantity
         )
         
-        # Get exit price from order
-        exit_price = 0.0
-        if 'avgPrice' in order:
-            exit_price = float(order['avgPrice'])
-        else:
+        time.sleep(0.5)
+        
+        order_id = order['orderId']
+        order_status = binance_client.futures_get_order(symbol=pair, orderId=order_id)
+        
+        exit_price = float(order_status.get('avgPrice', 0))
+        executed_qty = float(order_status.get('executedQty', quantity))
+        
+        if exit_price == 0:
             ticker = binance_client.futures_symbol_ticker(symbol=pair)
             exit_price = float(ticker['price'])
+            print(f"⚠️ Warning: Using ticker price for exit: ${exit_price:.8f}")
+        
+        if exit_price == 0:
+            raise Exception("Failed to get valid exit price from order")
+        
+        print(f"✅ POSITION CLOSED: Price=${exit_price:.8f}, Qty={executed_qty:.8f}")
         
         return {
             'success': True,
             'price': exit_price,
+            'quantity': executed_qty,
             'order': order
         }
     except Exception as e:
@@ -405,19 +548,42 @@ def calculate_pnl(pair, buy_price, current_balance):
         return None
 
 def calculate_futures_pnl(pair, entry_price, side, quantity):
-    """Calculate futures P&L"""
+    """Calculate futures P&L with real position verification"""
     try:
+        positions = binance_client.futures_position_information(symbol=pair)
+        position_amt = 0.0
+        unrealized_pnl = 0.0
+        
+        for pos in positions:
+            if pos['symbol'] == pair:
+                position_amt = float(pos['positionAmt'])
+                unrealized_pnl = float(pos['unRealizedProfit'])
+                break
+        
+        if position_amt == 0:
+            return {
+                'current_price': 0,
+                'pnl': 0,
+                'position_closed': True
+            }
+        
         ticker = binance_client.futures_symbol_ticker(symbol=pair)
         current_price = float(ticker['price'])
         
+        actual_qty = abs(position_amt)
+        
         if side == 'LONG':
-            pnl = (current_price - entry_price) * quantity
-        else:  # SHORT
-            pnl = (entry_price - current_price) * quantity
+            pnl = (current_price - entry_price) * actual_qty
+        else:
+            pnl = (entry_price - current_price) * actual_qty
         
         return {
             'current_price': current_price,
-            'pnl': pnl
+            'pnl': pnl,
+            'unrealized_pnl': unrealized_pnl,
+            'position_amt': position_amt,
+            'actual_quantity': actual_qty,
+            'position_closed': False
         }
     except Exception as e:
         print(f"Error calculating futures P&L: {e}")
@@ -605,7 +771,7 @@ def monitor_trade():
             time.sleep(2)
 
 def monitor_futures_trade():
-    """Monitor futures position"""
+    """Monitor futures position with real-time position verification"""
     global active_futures_trade
     
     pair = active_futures_trade['pair']
@@ -635,11 +801,30 @@ def monitor_futures_trade():
                 time.sleep(2)
                 continue
             
+            if pnl_data.get('position_closed', False):
+                print(f"⚠️ Position closed externally!")
+                message = f"⚠️ <b>Position Closed Externally</b>\n\n"
+                message += f"Detected that {pair} position was closed outside the bot.\n"
+                message += f"Trade monitoring stopped."
+                send_telegram(message)
+                with futures_lock:
+                    active_futures_trade['running'] = False
+                break
+            
             consecutive_errors = 0
             current_price = pnl_data['current_price']
             current_pnl = pnl_data['pnl']
+            unrealized_pnl = pnl_data.get('unrealized_pnl', current_pnl)
+            position_amt = pnl_data.get('position_amt', quantity)
+            actual_qty = pnl_data.get('actual_quantity', quantity)
             
-            print(f"📊 Futures {side} | Price: ${current_price:.8f} | P&L: ${current_pnl:.4f} | Target: ${profit_target:.4f}")
+            if abs(actual_qty - quantity) > 0.001:
+                print(f"⚠️ Position size changed: {quantity} → {actual_qty}")
+                with futures_lock:
+                    quantity = actual_qty
+                    active_futures_trade['quantity'] = actual_qty
+            
+            print(f"📊 Futures {side} | Price: ${current_price:.8f} | P&L: ${current_pnl:.4f} | Unrealized: ${unrealized_pnl:.4f} | Qty: {actual_qty:.4f} | Target: ${profit_target:.4f}")
             
             # Check profit target
             if current_pnl >= profit_target:
@@ -935,6 +1120,22 @@ Start with small amounts and low leverage.
             send_telegram(error_msg, message.chat.id)
             return
         
+        market_check = check_market_conditions(pair, is_futures=False)
+        if not market_check['valid']:
+            warning_msg = f"⚠️ <b>Market Condition Warning</b>\n\n"
+            warning_msg += f"Pair: {pair}\n"
+            warning_msg += f"Issue: {market_check['reason']}\n\n"
+            warning_msg += f"<i>Trading in such conditions may increase stop-loss hits.</i>\n"
+            warning_msg += f"Do you still want to proceed? (yes/no)"
+            send_telegram(warning_msg, message.chat.id)
+            print(f"⚠️ Market filter: {market_check['reason']}")
+        else:
+            analysis_msg = f"✅ <b>Market Analysis</b>\n\n"
+            analysis_msg += f"Trend: {market_check['trend']}\n"
+            analysis_msg += f"EMA Slope: {market_check['ema_slope']:.3f}%\n"
+            analysis_msg += f"ATR: {market_check['atr_percent']:.3f}%\n"
+            print(f"✅ Market conditions favorable: {market_check['trend']}")
+        
         with trade_lock:
             if active_trade['running']:
                 send_telegram("🚫 Spot trade already running!", message.chat.id)
@@ -1024,6 +1225,24 @@ Start with small amounts and low leverage.
             error_msg += "\n".join(f"• {e}" for e in errors)
             send_telegram(error_msg, message.chat.id)
             return
+        
+        market_check = check_market_conditions(pair, is_futures=True)
+        if not market_check['valid']:
+            warning_msg = f"⚠️ <b>Market Condition Warning</b>\n\n"
+            warning_msg += f"Pair: {pair}\n"
+            warning_msg += f"Issue: {market_check['reason']}\n\n"
+            warning_msg += f"<i>High leverage in such conditions is very risky!</i>\n"
+            warning_msg += f"Recommended: Wait for better market conditions"
+            send_telegram(warning_msg, message.chat.id)
+            print(f"⚠️ Futures market filter: {market_check['reason']}")
+        else:
+            analysis_msg = f"✅ <b>Futures Market Analysis</b>\n\n"
+            analysis_msg += f"Trend: {market_check['trend']}\n"
+            analysis_msg += f"EMA Slope: {market_check['ema_slope']:.3f}%\n"
+            analysis_msg += f"ATR: {market_check['atr_percent']:.3f}%\n"
+            analysis_msg += f"Leverage: {leverage}x\n"
+            send_telegram(analysis_msg, message.chat.id)
+            print(f"✅ Futures market conditions favorable: {market_check['trend']}")
         
         with futures_lock:
             if active_futures_trade['running']:
